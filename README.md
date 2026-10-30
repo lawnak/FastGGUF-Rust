@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/logo.webp" alt="FastGGUF Rust logo" width="400">
+</p>
+
 # fastgguf — Rust version
 
 A Rust port of [`fastgguf.c`](https://github.com/lawnak/FastGGUF): runs GGUF language models on your own computer, on
