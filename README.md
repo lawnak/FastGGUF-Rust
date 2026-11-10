@@ -67,6 +67,13 @@ What made the kernels fast (worth knowing before changing `simd.rs`):
 Differences from the C server: requests are parsed with a real JSON parser (`content` may also be
 a list of text parts), and a streamed reply never splits a UTF-8 character across two chunks.
 
+## Download
+
+A ready-made Windows build is on the [Releases](https://github.com/lawnak/FastGGUF-Rust/releases) page:
+`fastgguf-rs-<version>-windows-x64.zip` holds a single `fastgguf.exe` (no installation, no VC++
+runtime needed). Pushing a `v*` tag builds it with GitHub Actions (`.github/workflows/release.yml`),
+runs `selftest` and attaches the zip to the release.
+
 ## Build
 
 ```sh

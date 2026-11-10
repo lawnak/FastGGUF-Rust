@@ -1,0 +1,61 @@
+name: Release
+
+# Builds fastgguf.exe for Windows x64 and attaches it to the GitHub Release.
+# - Push a tag like v0.2.0: builds that tag and creates the release if it does not exist.
+# - Run it by hand (Actions tab -> Release -> Run workflow) to rebuild an existing tag.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and upload (for example v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      # Link the C runtime statically: the .exe then runs without the VC++ redistributable.
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Self-test
+        run: target\release\fastgguf.exe selftest
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "fastgguf-rs-$env:TAG-windows-x64"
+          New-Item -ItemType Directory -Force dist\$name | Out-Null
+          Copy-Item target\release\fastgguf.exe, README.md dist\$name\
+          Compress-Archive -Path dist\$name\* -DestinationPath dist\$name.zip -Force
+          "ZIP=dist/$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastgguf-windows-x64
+          path: ${{ env.ZIP }}
+
+      - name: Upload to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$TAG" > /dev/null 2>&1 ||
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" "$ZIP" --clobber
