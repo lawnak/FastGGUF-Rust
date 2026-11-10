@@ -1,6 +1,6 @@
 [package]
 name = "fastgguf"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Run GGUF language models on the CPU - Rust port of fastgguf.c"
 
