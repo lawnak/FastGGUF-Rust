@@ -22,9 +22,21 @@ pub struct Q40x8 {
     pub qs: [[[u8; 4]; 8]; 4], // [step s][row][i]
 }
 
+/// Q5_0: the four low bits like Q4_0; the fifth bits of a row are regrouped so that byte i of
+/// `hb` holds them for the values 4s+i (bit s) and 16+4s+i (bit 4+s) — one shift and one mask
+/// per step line them up with the nibbles
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Q50x8 {
+    pub d: [u16; 8],
+    pub hb: [[u8; 4]; 8],      // [row][i]
+    pub qs: [[[u8; 4]; 8]; 4], // [step s][row][i]
+}
+
 pub enum Repacked {
     Q4K(Vec<Q4Kx8>), // groups × blocks per row
     Q40(Vec<Q40x8>),
+    Q50(Vec<Q50x8>),
 }
 
 fn repack_q4k_group(src: &[u8], stride: usize, nb: usize, dst: &mut [Q4Kx8]) {
@@ -62,6 +74,26 @@ fn repack_q40_group(src: &[u8], stride: usize, nb: usize, dst: &mut [Q40x8]) {
     }
 }
 
+fn repack_q50_group(src: &[u8], stride: usize, nb: usize, dst: &mut [Q50x8]) {
+    for b in 0..nb {
+        for r in 0..8 {
+            let p = &src[r * stride + b * 22..];
+            dst[b].d[r] = rd_u16(p, 0);
+            let qh = rd_u32(p, 2);
+            let mut hb = [0u8; 4];
+            for s in 0..4 {
+                for i in 0..4 {
+                    hb[i] |= (((qh >> (4 * s + i)) & 1) << s) as u8 | (((qh >> (16 + 4 * s + i)) & 1) << (4 + s)) as u8;
+                }
+            }
+            dst[b].hb[r] = hb;
+            for s in 0..4 {
+                dst[b].qs[s][r].copy_from_slice(&p[6 + 4 * s..10 + 4 * s]);
+            }
+        }
+    }
+}
+
 /// re-arrange a [cols, rows] matrix if it qualifies; returns None otherwise
 pub fn repack(typ: u32, data: &[u8], cols: usize, rows: usize) -> Option<Repacked> {
     if rows % 8 != 0 {
@@ -83,6 +115,13 @@ pub fn repack(typ: u32, data: &[u8], cols: usize, rows: usize) -> Option<Repacke
         v.par_chunks_mut(nb).enumerate().for_each(|(g, dst)| repack_q40_group(&data[g * 8 * stride..], stride, nb, dst));
         return Some(Repacked::Q40(v));
     }
+    if typ == T_Q5_0 && cols % 32 == 0 {
+        let nb = cols / 32;
+        let zero = Q50x8 { d: [0; 8], hb: [[0; 4]; 8], qs: [[[0; 4]; 8]; 4] };
+        let mut v = vec![zero; ng * nb];
+        v.par_chunks_mut(nb).enumerate().for_each(|(g, dst)| repack_q50_group(&data[g * 8 * stride..], stride, nb, dst));
+        return Some(Repacked::Q50(v));
+    }
     None
 }
 
@@ -91,6 +130,7 @@ impl Repacked {
         match self {
             Repacked::Q4K(v) => v.len() * std::mem::size_of::<Q4Kx8>(),
             Repacked::Q40(v) => v.len() * std::mem::size_of::<Q40x8>(),
+            Repacked::Q50(v) => v.len() * std::mem::size_of::<Q50x8>(),
         }
     }
 }
@@ -155,6 +195,30 @@ pub fn dot_q40x8(blocks: &[Q40x8], y: &[Q8Blk], out: &mut [f32]) {
                     let v = bl.qs[s][r][i];
                     si += ((v & 0x0F) as i32 - 8) * y[b].qs[4 * s + i] as i32
                         + ((v >> 4) as i32 - 8) * y[b].qs[16 + 4 * s + i] as i32;
+                }
+            }
+            acc[r] += fp16(bl.d[r]) * y[b].d * si as f32;
+        }
+    }
+    out[..8].copy_from_slice(&acc);
+}
+
+/// out[0..8] for one Q5_0 group (portable version)
+pub fn dot_q50x8(blocks: &[Q50x8], y: &[Q8Blk], out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::avx2() {
+        return unsafe { crate::simd::simd_call!(dot_q50x8(blocks, y, out)) };
+    }
+    let mut acc = [0.0f32; 8];
+    for (b, bl) in blocks.iter().enumerate() {
+        for r in 0..8 {
+            let mut si = 0i32;
+            for s in 0..4 {
+                for i in 0..4 {
+                    let (v, h) = (bl.qs[s][r][i], bl.hb[r][i]);
+                    let lo = (v & 0x0F) as i32 | (((h >> s) & 1) as i32) << 4;
+                    let hi = (v >> 4) as i32 | (((h >> (4 + s)) & 1) as i32) << 4;
+                    si += (lo - 16) * y[b].qs[4 * s + i] as i32 + (hi - 16) * y[b].qs[16 + 4 * s + i] as i32;
                 }
             }
             acc[r] += fp16(bl.d[r]) * y[b].d * si as f32;
