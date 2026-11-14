@@ -3,8 +3,8 @@
 
 use crate::gguf::Tensor;
 use crate::quant::*;
+use crate::pool::SendPtr;
 use crate::repack::{self, Repacked};
-use rayon::prelude::*;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -139,7 +139,7 @@ pub fn axpy(y: &mut [f32], w: f32, x: &[f32]) {
 }
 
 #[inline(always)]
-fn prefetch_row(p: &[u8]) {
+pub fn prefetch_row(p: &[u8]) {
     #[cfg(target_arch = "x86_64")]
     if crate::simd::avx2() {
         // ask for the bytes 2 KB ahead: with compute between the loads the hardware
@@ -154,74 +154,109 @@ fn prefetch_row(p: &[u8]) {
     }
 }
 
-fn chunk_rows(rows: usize) -> usize {
-    let nt = rayon::current_num_threads().max(1);
-    (rows / (nt * 8)).clamp(4, 256)
+/// o = rows 8g .. 8g+8 of a repacked matrix times the quantized x (bsp: q4kx8_bsums for Q4_K)
+#[inline]
+fn group_rp(rp: &Repacked, g: usize, cols: usize, a: &QAct, bsp: &[i32], o: &mut [f32]) {
+    match rp {
+        Repacked::Q4K(v) => {
+            let nb = cols / 256;
+            repack::dot_q4kx8(&v[g * nb..(g + 1) * nb], &a.q8k, bsp, o);
+        }
+        Repacked::Q40(v) => {
+            let nb = cols / 32;
+            repack::dot_q40x8(&v[g * nb..(g + 1) * nb], &a.q8, o);
+        }
+        Repacked::Q50(v) => {
+            let nb = cols / 32;
+            repack::dot_q50x8(&v[g * nb..(g + 1) * nb], &a.q8, o);
+        }
+    }
 }
 
 /// out = W · x  (rows of W in parallel)
 pub fn matvec(t: &Tensor, x: &[f32], out: &mut [f32]) -> Result<(), String> {
-    let cols = t.cols();
-    let rows = t.rows();
+    matvec_multi(x, &mut [(t, out)])
+}
+
+/// out_i = W_i · x for several matrices with the same input (Q/K/V, FFN gate/up): x is
+/// quantized once and all the rows go through one parallel loop
+pub fn matvec_multi(x: &[f32], jobs: &mut [(&Tensor, &mut [f32])]) -> Result<(), String> {
+    struct Seg<'a> {
+        t: &'a Tensor,
+        out: SendPtr<f32>,
+        rows: usize,
+        stride: usize,
+        kind: Act,
+        first: usize, // first unit (8 rows) of this matrix in the shared loop
+    }
+    let cols = jobs.first().map(|j| j.0.cols()).unwrap_or(0);
     let x = &x[..cols];
-    let out = &mut out[..rows];
-    // weights in VRAM are multiplied there — any failure turns the GPU off and continues on the CPU
-    if let Some(m) = &t.gpu {
-        if crate::gpu::ready() {
-            match crate::gpu::matvec(m, t.typ, x, out) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    eprintln!("[gpu] matvec failed on {}: {e} - falling back to CPU", t.name);
-                    crate::gpu::disable();
+    let mut a = QAct::default();
+    let mut bsp = Vec::new();
+    let mut segs: Vec<Seg> = Vec::with_capacity(jobs.len());
+    let mut units = 0;
+    for (t, out) in jobs.iter_mut() {
+        let t: &Tensor = t;
+        let rows = t.rows();
+        if t.cols() != cols {
+            return Err(format!("matvec: {} does not take {cols} inputs", t.name));
+        }
+        let out = &mut out[..rows];
+        // weights in VRAM are multiplied there — any failure turns the GPU off and continues on the CPU
+        if let Some(m) = &t.gpu {
+            if crate::gpu::ready() {
+                match crate::gpu::matvec(m, t.typ, x, out) {
+                    Ok(()) => continue,
+                    Err(e) => {
+                        eprintln!("[gpu] matvec failed on {}: {e} - falling back to CPU", t.name);
+                        crate::gpu::disable();
+                    }
                 }
             }
         }
+        let kind = match &t.rp {
+            Some(Repacked::Q4K(_)) => Act::Q8K,
+            Some(_) => Act::Q8,
+            None => act_kind(t.typ, cols),
+        };
+        a.add(kind, x);
+        if matches!(t.rp, Some(Repacked::Q4K(_))) && bsp.is_empty() {
+            bsp = repack::q4kx8_bsums(&a.q8k, cols / 256);
+        }
+        segs.push(Seg { t, out: SendPtr(out.as_mut_ptr()), rows, stride: row_stride(t.typ, cols as u64) as usize, kind, first: units });
+        units += rows.div_ceil(8);
     }
-    if let Some(rp) = &t.rp {
-        matvec_rp(rp, cols, x, out);
-        return Ok(());
-    }
-    let stride = row_stride(t.typ, cols as u64) as usize;
-    let kind = act_kind(t.typ, cols);
-    let a = QAct::new(kind, x);
     let fail = AtomicBool::new(false);
-    let ch = chunk_rows(rows);
-    out.par_chunks_mut(ch).enumerate().for_each(|(ci, o)| {
-        for (i, v) in o.iter_mut().enumerate() {
-            let r = ci * ch + i;
-            let rb = &t.data[r * stride..(r + 1) * stride];
-            prefetch_row(rb);
-            match dot_row(t.typ, kind, rb, &a, x) {
-                Some(s) => *v = s,
-                None => fail.store(true, Ordering::Relaxed),
+    // pieces of at least ~16k weights, and about 4 per thread so a slower core does not hold the rest up
+    let chunk = (units / (crate::pool::threads() * 4)).max(16384 / (8 * cols.max(1))).max(1);
+    let (a, bsp) = (&a, &bsp);
+    crate::pool::par_for(units, chunk, |u0, u1| {
+        for s in &segs {
+            let (g0, g1) = (u0.max(s.first) - s.first, u1.min(s.first + s.rows.div_ceil(8)).saturating_sub(s.first));
+            for g in g0..g1 {
+                let n = (s.rows - g * 8).min(8);
+                // SAFETY: every unit is handed to one thread only, and it covers rows g*8 .. g*8+n
+                let o = unsafe { std::slice::from_raw_parts_mut(s.out.get().add(g * 8), n) };
+                match &s.t.rp {
+                    Some(rp) => group_rp(rp, g, cols, a, bsp, o),
+                    None => {
+                        for (i, v) in o.iter_mut().enumerate() {
+                            let r = g * 8 + i;
+                            let rb = &s.t.data[r * s.stride..(r + 1) * s.stride];
+                            prefetch_row(rb);
+                            match dot_row(s.t.typ, s.kind, rb, a, x) {
+                                Some(d) => *v = d,
+                                None => fail.store(true, Ordering::Relaxed),
+                            }
+                        }
+                    }
+                }
             }
         }
     });
     if fail.load(Ordering::Relaxed) {
-        return Err(format!("matvec: unsupported type {} in {}", type_name(t.typ), t.name));
+        let names: Vec<String> = segs.iter().map(|s| format!("{} ({})", s.t.name, type_name(s.t.typ))).collect();
+        return Err(format!("matvec: unsupported type in {}", names.join(", ")));
     }
     Ok(())
-}
-
-/// y = W·x for a repacked tensor: 8 rows per kernel call
-fn matvec_rp(rp: &Repacked, cols: usize, x: &[f32], out: &mut [f32]) {
-    match rp {
-        Repacked::Q4K(v) => {
-            let nb = cols / 256;
-            let a = QAct::new(Act::Q8K, x);
-            let bsp = repack::q4kx8_bsums(&a.q8k, nb);
-            out.par_chunks_mut(8)
-                .with_min_len(4)
-                .enumerate()
-                .for_each(|(g, o)| repack::dot_q4kx8(&v[g * nb..(g + 1) * nb], &a.q8k, &bsp, o));
-        }
-        Repacked::Q40(v) => {
-            let nb = cols / 32;
-            let a = QAct::new(Act::Q8, x);
-            out.par_chunks_mut(8)
-                .with_min_len(4)
-                .enumerate()
-                .for_each(|(g, o)| repack::dot_q40x8(&v[g * nb..(g + 1) * nb], &a.q8, o));
-        }
-    }
 }

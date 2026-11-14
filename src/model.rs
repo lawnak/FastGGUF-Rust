@@ -4,7 +4,8 @@
 use crate::batch;
 use crate::gguf::{Gguf, KvVal, Tensor};
 use crate::gpu;
-use crate::matvec::{act_kind, axpy, dot_f32, dot_row, matvec, QAct};
+use crate::matvec::{act_kind, axpy, dot_f32, dot_row, matvec, matvec_multi, QAct};
+use crate::sketch::Sketch;
 use crate::ops::{self, kvq};
 use crate::quant::*;
 use crate::repack;
@@ -89,7 +90,7 @@ pub struct Model {
     rope_freqs: Option<Vec<f32>>,
     pub layers: Vec<Layer>,
 
-    // KV cache per owning layer — a ring buffer for sliding-window layers
+    // KV cache per owning layer — a ring buffer for sliding-window layers; f32 layout: see kv_store
     cache_k: Vec<Vec<f32>>,
     cache_v: Vec<Vec<f32>>,
     cache_cap: Vec<usize>,
@@ -122,6 +123,10 @@ pub struct Model {
     moe_probs: Vec<f32>,
     moe_h: Vec<f32>,
     bb: Option<Box<BatchBufs>>,
+    /// 2-bit copy of the output matrix for the two-stage head (FASTGGUF_HEAD=exact: none)
+    head_sketch: Option<Sketch>,
+    /// seconds spent by forward() in: attention projections, attention, FFN, output head (`bench`)
+    pub prof: [f64; 4],
 }
 
 thread_local! {
@@ -511,6 +516,8 @@ impl Model {
             moe_probs: vec![0.0; n_expert],
             moe_h: vec![0.0; n_expert_used * ff_exp],
             bb: None,
+            head_sketch: None,
+            prof: [0.0; 4],
             layers,
             g,
         };
@@ -600,8 +607,26 @@ impl Model {
             }
             if n > 0 {
                 println!(
-                    "[repack] {n} Q4_K / Q4_0 tensors ({:.0} MB) arranged for the 8-row kernel in {:.1}s",
+                    "[repack] {n} Q4_K / Q4_0 / Q5_0 tensors ({:.0} MB) arranged for the 8-row kernel in {:.1}s",
                     bytes as f64 / 1048576.0,
+                    t0.elapsed().as_secs_f64()
+                );
+            }
+        }
+
+        // a 2-bit copy of a large output matrix: the head scores all tokens with it and recomputes
+        // the likely ones from the real weights (sketch.rs)
+        if !env_is("FASTGGUF_HEAD", "exact") {
+            let t0 = Instant::now();
+            let t = &m.g.tensors[m.output];
+            if t.gpu.is_none() {
+                m.head_sketch = Sketch::build(t);
+            }
+            if let Some(sk) = &m.head_sketch {
+                println!(
+                    "[head] two-stage output head: 2-bit sketch of {} ({:.0} MB) built in {:.1}s (FASTGGUF_HEAD=exact turns it off)",
+                    type_name(t.typ),
+                    sk.bytes() as f64 / 1048576.0,
                     t0.elapsed().as_secs_f64()
                 );
             }
@@ -662,7 +687,10 @@ impl Model {
         }
 
         // 3. the layers
+        let mut prof = [0.0f64; 4];
+        let mut rope: [Option<(usize, ops::RopeTab)>; 2] = [None, None];
         for il in 0..self.n_layer {
+            let t0 = Instant::now();
             let l = &self.layers[il];
             let swa = self.is_swa[il];
             let hd = l.head_dim;
@@ -678,29 +706,46 @@ impl Model {
             self.cur.copy_from_slice(&self.x);
             ops::rmsnorm_w(&mut self.cur, &l.attn_norm, eps);
 
-            // Q → bias → per-head norm → RoPE
+            // Q (and K/V for layers that own their cache entries) in one pass over the threads
             let q = &mut self.q[..q_dim];
-            matvec(&tensors[l.wq], &self.cur, q)?;
+            let own_kv = il < self.n_kv_from_start;
+            {
+                let (k, v) = (&mut self.k[..l.kv_dim], &mut self.v[..l.kv_dim]);
+                let mut jobs: Vec<(&Tensor, &mut [f32])> = Vec::with_capacity(3);
+                jobs.push((&tensors[l.wq], &mut *q));
+                if own_kv {
+                    jobs.push((&tensors[l.wk.unwrap()], k));
+                    if let Some(wv) = l.wv {
+                        jobs.push((&tensors[wv], v));
+                    }
+                }
+                matvec_multi(&self.cur, &mut jobs)?;
+            }
+            // Q → bias → per-head norm → RoPE
             if let Some(b) = &l.bq {
                 q.iter_mut().zip(b).for_each(|(v, b)| *v += b);
             }
             if let Some(qn) = &l.q_norm {
                 q.chunks_exact_mut(hd).for_each(|h| ops::rmsnorm_w(h, qn, eps));
             }
-            ops::apply_rope(q, pos, hd, n_rot, base, fscale, ff, self.rope_neox);
+            // one cos/sin table per token for each kind of layer (sliding-window / global)
+            let rt = &mut rope[swa as usize];
+            if rt.as_ref().is_none_or(|(n, _)| *n != n_rot) {
+                *rt = Some((n_rot, ops::RopeTab::new(pos, n_rot, base, fscale, ff)));
+            }
+            let rt = &rt.as_ref().unwrap().1;
+            rt.rotate(q, hd, self.rope_neox);
 
             // K/V for layers that own their cache entries
-            if il < self.n_kv_from_start {
+            if own_kv {
                 let kv_dim = l.kv_dim;
                 let k = &mut self.k[..kv_dim];
                 let v = &mut self.v[..kv_dim];
-                matvec(&tensors[l.wk.unwrap()], &self.cur, k)?;
                 if let Some(b) = &l.bk {
                     k.iter_mut().zip(b).for_each(|(x, b)| *x += b);
                 }
                 match l.wv {
-                    Some(wv) => {
-                        matvec(&tensors[wv], &self.cur, v)?;
+                    Some(_) => {
                         if let Some(b) = &l.bv {
                             v.iter_mut().zip(b).for_each(|(x, b)| *x += b);
                         }
@@ -715,7 +760,7 @@ impl Model {
                         ops::rmsnorm_plain(&mut v[h * hd..(h + 1) * hd], eps);
                     }
                 }
-                ops::apply_rope(k, pos, hd, n_rot, base, fscale, ff, self.rope_neox);
+                rt.rotate(k, hd, self.rope_neox);
 
                 let slot = pos % self.cache_cap[il];
                 if self.kvq {
@@ -731,15 +776,16 @@ impl Model {
                         kvq::quant_slice(vh, &mut self.cache_vq[il][slot * vs + h * rv..][..rv], self.vbits);
                     }
                 } else {
-                    self.cache_k[il][slot * kv_dim..(slot + 1) * kv_dim].copy_from_slice(k);
-                    self.cache_v[il][slot * kv_dim..(slot + 1) * kv_dim].copy_from_slice(v);
+                    kv_store(&mut self.cache_k[il], k, slot, self.cache_cap[il], hd);
+                    kv_store(&mut self.cache_v[il], v, slot, self.cache_cap[il], hd);
                 }
             }
 
+            let t1 = Instant::now();
             // attention — Gemma 4: scale 1 (q/k normalized), Gemma 3: 1/√qpas, others 1/√head_dim
             let qk_scale = if self.attn_scale > 0.0 { self.attn_scale } else { 1.0 / (hd as f32).sqrt() };
             let dl = self.kv_donor[il];
-            let (kv_dim, n_head_kv, cap) = (self.layers[dl].kv_dim, self.layers[dl].n_head_kv, self.cache_cap[dl]);
+            let (n_head_kv, cap) = (self.layers[dl].n_head_kv, self.cache_cap[dl]);
             let start = window_start(swa, self.n_swa, pos, cap);
             let np = pos + 1 - start;
 
@@ -755,7 +801,6 @@ impl Model {
                 vbits: self.vbits,
                 hd,
                 cap,
-                kv_dim,
                 n_head_kv,
                 n_head,
                 qk_scale,
@@ -765,17 +810,21 @@ impl Model {
                 cvq: &self.cache_vq[dl],
             };
             let out = &mut self.attn_out[..q_dim];
-            let job = |h: usize, oh: &mut [f32]| at.head(h, &q[h * hd..(h + 1) * hd], oh, start, pos);
-            if np * n_head >= 2048 {
-                out.par_chunks_mut(hd).enumerate().for_each(|(h, oh)| job(h, oh));
-            } else {
-                out.chunks_mut(hd).enumerate().for_each(|(h, oh)| job(h, oh));
-            }
+            // the heads in parallel once there is enough to read (np positions × q_dim floats, twice)
+            let optr = crate::pool::SendPtr(out.as_mut_ptr());
+            crate::pool::par_for(n_head, if np * q_dim >= 65536 { 1 } else { n_head }, |h0, h1| {
+                for h in h0..h1 {
+                    // SAFETY: head h is handed to one thread only and owns out[h*hd .. (h+1)*hd]
+                    let oh = unsafe { std::slice::from_raw_parts_mut(optr.get().add(h * hd), hd) };
+                    at.head(h, &q[h * hd..(h + 1) * hd], oh, start, pos);
+                }
+            });
             if kvq_on {
                 // the value sum is in rotated space: rotate it back before the output projection
                 out.chunks_exact_mut(hd).for_each(kvq::unrotate);
             }
 
+            let t2 = Instant::now();
             // output projection + post-attention norm + residual
             matvec(&tensors[l.wo], &self.attn_out[..q_dim], &mut self.ao)?;
             if let Some(pn) = &l.attn_post_norm {
@@ -783,6 +832,7 @@ impl Model {
             }
             self.ao.iter_mut().zip(&self.x).for_each(|(a, x)| *a += x);
 
+            let t3 = Instant::now();
             // FFN — GELU (Gemma), SiLU (the rest) or the MoE experts
             self.f.copy_from_slice(&self.ao);
             ops::rmsnorm_w(&mut self.f, &l.ffn_norm, eps);
@@ -801,12 +851,11 @@ impl Model {
             } else {
                 let ffd = l.ff_dim;
                 let (gate, up) = (&mut self.gate[..ffd], &mut self.up[..ffd]);
-                matvec(&tensors[l.ffn_gate.unwrap()], &self.f, gate)?;
-                matvec(&tensors[l.ffn_up.unwrap()], &self.f, up)?;
+                matvec_multi(&self.f, &mut [(&tensors[l.ffn_gate.unwrap()], &mut *gate), (&tensors[l.ffn_up.unwrap()], &mut *up)])?;
                 if self.act_gelu {
-                    gate.iter_mut().zip(up.iter()).for_each(|(g, u)| *g = ops::gelu(*g) * u);
+                    ops::gelu_mul(gate, up);
                 } else {
-                    gate.iter_mut().zip(up.iter()).for_each(|(g, u)| *g = ops::silu(*g) * u);
+                    ops::silu_mul(gate, up);
                 }
                 matvec(&tensors[l.ffn_down.unwrap()], gate, &mut self.ffn_out)?;
             }
@@ -829,14 +878,19 @@ impl Model {
                 self.ffn_out.iter_mut().for_each(|v| *v *= s);
             }
             self.x.copy_from_slice(&self.ffn_out);
+            let t4 = Instant::now();
+            prof[0] += (t1 - t0 + (t3 - t2)).as_secs_f64();
+            prof[1] += (t2 - t1).as_secs_f64();
+            prof[2] += (t4 - t3).as_secs_f64();
         }
+        let t5 = Instant::now();
 
         // 4. final norm + LM head + soft-capping
         ops::rmsnorm_w(&mut self.x, &self.output_norm, eps);
-        matvec(&tensors[self.output], &self.x, &mut self.logits)?;
-        if self.final_softcap > 0.0 {
-            let cp = self.final_softcap;
-            self.logits.iter_mut().for_each(|v| *v = cp * (*v / cp).tanh());
+        self.head()?;
+        prof[3] = t5.elapsed().as_secs_f64();
+        for (a, b) in self.prof.iter_mut().zip(prof) {
+            *a += b;
         }
         Ok(())
     }
@@ -948,8 +1002,8 @@ impl Model {
                             kvq::quant_slice(vh, &mut self.cache_vq[il][slot * vs + h * rv..][..rv], self.vbits);
                         }
                     } else {
-                        self.cache_k[il][slot * kv_dim..(slot + 1) * kv_dim].copy_from_slice(k);
-                        self.cache_v[il][slot * kv_dim..(slot + 1) * kv_dim].copy_from_slice(v);
+                        kv_store(&mut self.cache_k[il], k, slot, cap, hd);
+                        kv_store(&mut self.cache_v[il], v, slot, cap, hd);
                     }
                 }
             }
@@ -957,7 +1011,7 @@ impl Model {
             // attention: every (token, head) pair is independent; token b sees positions up to pos0+b
             let qk_scale = if self.attn_scale > 0.0 { self.attn_scale } else { 1.0 / (hd as f32).sqrt() };
             let dl = self.kv_donor[il];
-            let (kv_dim, n_head_kv, cap) = (self.layers[dl].kv_dim, self.layers[dl].n_head_kv, self.cache_cap[dl]);
+            let (n_head_kv, cap) = (self.layers[dl].n_head_kv, self.cache_cap[dl]);
             if self.kvq {
                 bb.q[..nb * lq].par_chunks_mut(lq).for_each(|r| r[..q_dim].chunks_exact_mut(hd).for_each(kvq::rotate));
             }
@@ -967,7 +1021,6 @@ impl Model {
                 vbits: self.vbits,
                 hd,
                 cap,
-                kv_dim,
                 n_head_kv,
                 n_head,
                 qk_scale,
@@ -1024,9 +1077,9 @@ impl Model {
                 bb.gate[..nb * lf].par_chunks_mut(lf).enumerate().for_each(|(b, g)| {
                     let u = &up[b * lf..b * lf + fd];
                     if gelu {
-                        g[..fd].iter_mut().zip(u).for_each(|(g, u)| *g = ops::gelu(*g) * u);
+                        ops::gelu_mul(&mut g[..fd], u);
                     } else {
-                        g[..fd].iter_mut().zip(u).for_each(|(g, u)| *g = ops::silu(*g) * u);
+                        ops::silu_mul(&mut g[..fd], u);
                     }
                 });
                 batch::matmul(&tensors[l.ffn_down.unwrap()], &bb.gate, lf, &mut bb.ffn, e, nb)?;
@@ -1051,12 +1104,44 @@ impl Model {
         // final norm + LM head + soft-capping — only the last token's logits are needed
         self.x.copy_from_slice(&bb.x[(nb - 1) * e..nb * e]);
         ops::rmsnorm_w(&mut self.x, &self.output_norm, eps);
-        matvec(&tensors[self.output], &self.x, &mut self.logits)?;
+        self.head()?;
+        Ok(())
+    }
+
+    /// logits = W_out · x (x already normalized) + soft-capping
+    fn head(&mut self) -> Result<(), String> {
+        let t = &self.g.tensors[self.output];
+        match &self.head_sketch {
+            Some(sk) => sk.matvec(t, &self.x, &mut self.logits)?,
+            None => matvec(t, &self.x, &mut self.logits)?,
+        }
         if self.final_softcap > 0.0 {
-            let cp = self.final_softcap;
-            self.logits.iter_mut().for_each(|v| *v = cp * (*v / cp).tanh());
+            ops::softcap(&mut self.logits, self.final_softcap);
         }
         Ok(())
+    }
+
+    /// two-stage head check (`bench`): are the 64 most likely tokens the same ones, with the
+    /// same logits (up to float rounding), as with the plain head? None when there is no sketch
+    pub fn head_check(&mut self) -> Result<Option<bool>, String> {
+        if self.head_sketch.is_none() {
+            return Ok(None);
+        }
+        let top = |l: &[f32]| {
+            let mut c = Vec::new();
+            crate::sampler::top_k_select(l, 64, &mut c);
+            c.sort_unstable_by_key(|e| e.id);
+            c
+        };
+        let fast = top(&self.logits);
+        let mut exact = vec![0.0f32; self.logits.len()];
+        matvec(&self.g.tensors[self.output], &self.x, &mut exact)?;
+        if self.final_softcap > 0.0 {
+            ops::softcap(&mut exact, self.final_softcap);
+        }
+        let exact = top(&exact);
+        let same = |a: f32, b: f32| (a - b).abs() <= 1e-4 * a.abs().max(b.abs()).max(1.0);
+        Ok(Some(fast.len() == exact.len() && fast.iter().zip(&exact).all(|(f, e)| f.id == e.id && same(f.v, e.v))))
     }
 
     /// how many tokens at the start of ids are already in the KV cache and can be kept
@@ -1094,6 +1179,15 @@ fn window_start(swa: bool, n_swa: usize, pos: usize, cap: usize) -> usize {
     start
 }
 
+/// The f32 KV cache is stored head by head: [kv head][slot][head_dim]. One attention head then
+/// reads its keys (and values) as one run of memory instead of one short slice per position,
+/// each a whole row and a memory page apart.
+fn kv_store(cache: &mut [f32], row: &[f32], slot: usize, cap: usize, hd: usize) {
+    for (h, src) in row.chunks_exact(hd).enumerate() {
+        cache[(h * cap + slot) * hd..][..hd].copy_from_slice(src);
+    }
+}
+
 /// what one layer's attention reads: the donor layer's cache and the shapes
 struct Attn<'a> {
     kvq: bool,
@@ -1101,7 +1195,6 @@ struct Attn<'a> {
     vbits: usize,
     hd: usize,
     cap: usize,
-    kv_dim: usize,
     n_head_kv: usize,
     n_head: usize,
     qk_scale: f32,
@@ -1114,34 +1207,44 @@ struct Attn<'a> {
 impl Attn<'_> {
     /// oh = softmax(q·K / scale) · V over positions start..=pos for query head h
     fn head(&self, h: usize, qh: &[f32], oh: &mut [f32], start: usize, pos: usize) {
-        let (hd, cap, kv_dim) = (self.hd, self.cap, self.kv_dim);
+        let (hd, cap) = (self.hd, self.cap);
         let kvh = h * self.n_head_kv / self.n_head;
         let (rk, rv) = (kvq::rec(hd, self.kbits), kvq::rec(hd, self.vbits));
         let np = pos + 1 - start;
+        // positions start..=pos sit in the ring buffer as at most two runs of consecutive slots
+        let s0 = start % cap;
+        let n1 = np.min(cap - s0);
+        let runs = [(s0, n1), (0, np - n1)];
         SCORES.with(|s| {
             let mut s = s.borrow_mut();
             s.resize(np, 0.0);
-            for p in start..=pos {
-                let slot = p % cap;
-                let d = if self.kvq {
-                    kvq::dot_k(qh, &self.ckq[slot * self.n_head_kv * rk + kvh * rk..][..rk], self.kbits)
-                } else {
-                    dot_f32(qh, &self.ck[slot * kv_dim + kvh * hd..][..hd])
-                };
-                s[p - start] = d * self.qk_scale;
+            let mut i = 0;
+            for (slot0, n) in runs {
+                for slot in slot0..slot0 + n {
+                    let d = if self.kvq {
+                        kvq::dot_k(qh, &self.ckq[slot * self.n_head_kv * rk + kvh * rk..][..rk], self.kbits)
+                    } else {
+                        dot_f32(qh, &self.ck[(kvh * cap + slot) * hd..][..hd])
+                    };
+                    s[i] = d * self.qk_scale;
+                    i += 1;
+                }
             }
             ops::softmax(&mut s[..np]);
             oh.fill(0.0);
-            for p in start..=pos {
-                let w = s[p - start];
-                if w == 0.0 {
-                    continue;
-                }
-                let slot = p % cap;
-                if self.kvq {
-                    kvq::axpy_v(oh, w, &self.cvq[slot * self.n_head_kv * rv + kvh * rv..][..rv], self.vbits);
-                } else {
-                    axpy(oh, w, &self.cv[slot * kv_dim + kvh * hd..][..hd]);
+            let mut i = 0;
+            for (slot0, n) in runs {
+                for slot in slot0..slot0 + n {
+                    let w = s[i];
+                    i += 1;
+                    if w == 0.0 {
+                        continue;
+                    }
+                    if self.kvq {
+                        kvq::axpy_v(oh, w, &self.cvq[slot * self.n_head_kv * rv + kvh * rv..][..rv], self.vbits);
+                    } else {
+                        axpy(oh, w, &self.cv[(kvh * cap + slot) * hd..][..hd]);
+                    }
                 }
             }
         });

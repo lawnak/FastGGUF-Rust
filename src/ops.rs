@@ -1,10 +1,19 @@
 // Basic ops: RMSNorm / GELU / SiLU / RoPE / softmax, the RNG, and the TurboQuant KV cache.
 
+/// Σ x² in double precision
+fn sumsq(x: &[f32]) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::avx2() {
+        // SAFETY: the CPU has AVX2/FMA
+        return unsafe { crate::simd::simd_call!(sumsq(x)) };
+    }
+    x.iter().map(|&v| v as f64 * v as f64).sum()
+}
+
 /// note: Gemma norm weights in GGUF already include the (+1) — multiply directly
 pub fn rmsnorm_w(x: &mut [f32], w: &[f32], eps: f32) {
     let n = x.len();
-    let ss: f64 = x.iter().map(|&v| v as f64 * v as f64).sum();
-    let inv = (1.0 / (ss / n as f64 + eps as f64).sqrt()) as f32;
+    let inv = (1.0 / (sumsq(x) / n as f64 + eps as f64).sqrt()) as f32;
     for (v, w) in x.iter_mut().zip(w) {
         *v = *v * inv * w;
     }
@@ -12,8 +21,7 @@ pub fn rmsnorm_w(x: &mut [f32], w: &[f32], eps: f32) {
 
 pub fn rmsnorm_plain(x: &mut [f32], eps: f32) {
     let n = x.len();
-    let ss: f64 = x.iter().map(|&v| v as f64 * v as f64).sum();
-    let inv = (1.0 / (ss / n as f64 + eps as f64).sqrt()) as f32;
+    let inv = (1.0 / (sumsq(x) / n as f64 + eps as f64).sqrt()) as f32;
     for v in x.iter_mut() {
         *v *= inv;
     }
@@ -29,8 +37,80 @@ pub fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
-/// RoPE on the first n_rot dims of each head of x (length = heads × head_dim)
-///   neox: halves (Gemma/Qwen), otherwise adjacent pairs (Llama/Mistral)
+/// g = gelu(g) · u (the FFN of Gemma). The AVX kernels compute the same function with a
+/// vector e^x instead of tanh(): results differ in float rounding only
+pub fn gelu_mul(g: &mut [f32], u: &[f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::avx2() {
+        return unsafe { crate::simd::simd_call!(gelu_mul(g, u)) };
+    }
+    g.iter_mut().zip(u).for_each(|(g, u)| *g = gelu(*g) * u);
+}
+
+/// g = silu(g) · u
+pub fn silu_mul(g: &mut [f32], u: &[f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::avx2() {
+        return unsafe { crate::simd::simd_call!(silu_mul(g, u)) };
+    }
+    g.iter_mut().zip(u).for_each(|(g, u)| *g = silu(*g) * u);
+}
+
+/// v = cp · tanh(v / cp) (Gemma 2 final logit soft-capping)
+pub fn softcap(v: &mut [f32], cp: f32) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::avx2() {
+        return unsafe { crate::simd::simd_call!(softcap(v, cp)) };
+    }
+    v.iter_mut().for_each(|v| *v = cp * (*v / cp).tanh());
+}
+
+/// cos/sin of the RoPE angles of one position: they depend only on the position and the pair
+/// index, so one table serves every head (and every layer of the same kind)
+pub struct RopeTab {
+    pub half: usize,
+    pub cs: [f32; 512],
+    pub sn: [f32; 512],
+}
+
+impl RopeTab {
+    pub fn new(pos: usize, n_rot: usize, base: f64, freq_scale: f64, freq_factors: Option<&[f32]>) -> RopeTab {
+        let mut t = RopeTab { half: (n_rot / 2).min(512), cs: [0.0; 512], sn: [0.0; 512] };
+        for j in 0..t.half {
+            let mut theta = pos as f64 * freq_scale / base.powf((2 * j) as f64 / n_rot as f64);
+            if let Some(ff) = freq_factors {
+                theta /= ff[j] as f64;
+            }
+            t.cs[j] = theta.cos() as f32;
+            t.sn[j] = theta.sin() as f32;
+        }
+        t
+    }
+
+    /// rotate the first n_rot dims of each head of x (length = heads × head_dim)
+    ///   neox: halves (Gemma/Qwen), otherwise adjacent pairs (Llama/Mistral)
+    pub fn rotate(&self, x: &mut [f32], head_dim: usize, neox: bool) {
+        let half = self.half;
+        for h in x.chunks_exact_mut(head_dim) {
+            if neox {
+                let (a, b) = h.split_at_mut(half);
+                for j in 0..half {
+                    let (v0, v1) = (a[j], b[j]);
+                    a[j] = v0 * self.cs[j] - v1 * self.sn[j];
+                    b[j] = v0 * self.sn[j] + v1 * self.cs[j];
+                }
+            } else {
+                for j in 0..half {
+                    let (v0, v1) = (h[2 * j], h[2 * j + 1]);
+                    h[2 * j] = v0 * self.cs[j] - v1 * self.sn[j];
+                    h[2 * j + 1] = v0 * self.sn[j] + v1 * self.cs[j];
+                }
+            }
+        }
+    }
+}
+
+/// RoPE on the first n_rot dims of each head of x
 ///   freq_scale: linear position scaling (1/factor) — large Gemma 3 models use it on global layers
 #[allow(clippy::too_many_arguments)]
 pub fn apply_rope(
@@ -43,29 +123,14 @@ pub fn apply_rope(
     freq_factors: Option<&[f32]>,
     neox: bool,
 ) {
-    let half = (n_rot / 2).min(512);
-    // the angles depend only on the position and the pair index: compute them once
-    let mut cs = [0.0f32; 512];
-    let mut sn = [0.0f32; 512];
-    for j in 0..half {
-        let mut theta = pos as f64 * freq_scale / base.powf((2 * j) as f64 / n_rot as f64);
-        if let Some(ff) = freq_factors {
-            theta /= ff[j] as f64;
-        }
-        cs[j] = theta.cos() as f32;
-        sn[j] = theta.sin() as f32;
-    }
-    for h in x.chunks_exact_mut(head_dim) {
-        for j in 0..half {
-            let (i0, i1) = if neox { (j, j + half) } else { (2 * j, 2 * j + 1) };
-            let (v0, v1) = (h[i0], h[i1]);
-            h[i0] = v0 * cs[j] - v1 * sn[j];
-            h[i1] = v0 * sn[j] + v1 * cs[j];
-        }
-    }
+    RopeTab::new(pos, n_rot, base, freq_scale, freq_factors).rotate(x, head_dim, neox);
 }
 
 pub fn softmax(s: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::avx2() {
+        return unsafe { crate::simd::simd_call!(softmax(s)) };
+    }
     let mx = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
     for v in s.iter_mut() {
@@ -80,16 +145,30 @@ pub fn softmax(s: &mut [f32]) {
     }
 }
 
+/// index of the largest value (the first one when several are equal; NaN is never picked)
 pub fn argmax(v: &[f32]) -> usize {
-    let mut best = 0;
-    let mut bv = f32::NEG_INFINITY;
-    for (i, &x) in v.iter().enumerate() {
-        if x > bv {
-            bv = x;
-            best = i;
+    // the maximum in 8 independent lanes (the compiler turns this into vector max), then
+    // the first place it occurs
+    let mut m = [f32::NEG_INFINITY; 8];
+    let chunks = v.chunks_exact(8);
+    let rest = chunks.remainder();
+    for c in chunks {
+        for (m, &x) in m.iter_mut().zip(c) {
+            if x > *m {
+                *m = x;
+            }
         }
     }
-    best
+    let mut best = f32::NEG_INFINITY;
+    for &x in m.iter().chain(rest) {
+        if x > best {
+            best = x;
+        }
+    }
+    if best == f32::NEG_INFINITY {
+        return 0;
+    }
+    v.iter().position(|&x| x == best).unwrap_or(0)
 }
 
 /// xorshift64*

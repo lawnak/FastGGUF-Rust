@@ -13,6 +13,7 @@ AVX2 / AVX-VNNI / AVX-512 VNNI kernels.
 fastgguf chat     model.gguf [ctx] [--temp 1.0] [--top-k 64] [--top-p 0.95]
                   [--repeat-penalty 1.0] [--repeat-last-n 64] [--max-tokens 512] [--seed N]
 fastgguf serve    model.gguf [model2.gguf ... up to 4] [port 8080] [ctx 4096]
+fastgguf bench    model.gguf [tokens 128] [ctx 2048]   generation speed, no tokenizer needed
 fastgguf inspect  model.gguf
 fastgguf dump     model.gguf
 fastgguf gpu      list GPUs / check OpenCL support
@@ -26,7 +27,7 @@ fastgguf selftest
 | GGUF reader (mmap), `inspect`, `dump` | done — output identical to the C version |
 | All quant types: F32 F16 BF16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K Q3_K Q4_K Q5_K Q6_K IQ4_NL IQ4_XS | done |
 | CPU kernels: AVX2, AVX-VNNI, AVX-512 VNNI — all in one binary, the best one picked at start-up | done |
-| Q4_K / Q4_0 8-row repacked kernels | done |
+| Q4_K / Q4_0 / Q5_0 8-row repacked kernels | done |
 | Gemma 2/3/3n/4, Qwen2/3, Qwen3 MoE, Llama/Mistral forward pass | done |
 | Tokenizer (SPM + BPE), chat templates, sampler, terminal chat | done |
 | TurboQuant KV cache (`FASTGGUF_KV=turbo…`) | done |
@@ -63,6 +64,46 @@ What made the kernels fast (worth knowing before changing `simd.rs`):
   becomes a chain of dependent additions. Q2_K/Q3_K collect them per block and add them as one vector.
 - **`cvtss2si` for rounding** in the activation quantizer (`quant::rnd`): `round_ties_even()`
   is a library call per value on the baseline x86-64 target.
+
+## Generation speed
+
+Single-token generation was reworked after the port. `fastgguf bench model.gguf` measures it
+(greedy, no tokenizer) and prints where a token's time goes. On a 4-core cloud Xeon (AVX-512
+VNNI), with random-weight files shaped like real models (tok/s, before → after):
+
+| Shape | Before | After |
+|---|---|---|
+| Gemma 3 270M, Q4_K_M layout (Q5_0 / Q4_K layers, Q8_0 head) | 64 | 250 |
+| Gemma 3 1B, Q4_K_M layout | 23 | 57 |
+| Qwen3 0.6B, Q4_K layers, Q6_K head | 41 | 96 |
+
+What changed:
+
+- **Own thread pool for generation** (`pool.rs`). A token is a few hundred parallel loops of tens
+  of microseconds each. Workers now spin between loops instead of sleeping and take large pieces
+  of work from one counter; rayon's task splitting and wake-ups cost more than the loops
+  themselves. Prompt batches still use rayon.
+- **Q/K/V and FFN gate/up in one pass**: the input is quantized once and the matrices share one
+  parallel loop.
+- **Q5_0 in the 8-row layout** (what a Gemma Q4_K_M file really holds: 640 or 1152 columns are
+  not a multiple of 256, so llama.cpp stores those matrices as Q5_0).
+- **Vector GELU / SiLU / softmax / soft-cap** instead of one `tanh()` / `exp()` call per value —
+  the FFN activation alone was a fifth of a Gemma 1B token.
+- **RoPE angles once per token**, not once per layer and twice.
+- **KV cache stored head by head**, so a head reads its keys as one run of memory.
+- **Two-stage output head** (`sketch.rs`). The output matrix is the largest one of a small model
+  (two thirds of Gemma 270M). Every token is first scored with a 2-bit copy of it, then the ~4000
+  best are recomputed from the real weights. The logits of all likely tokens are exactly those of
+  the plain head; only the far tail, which top-k / top-p never reach, carries the 2-bit rounding.
+  `bench` compares both heads on your model ("top-64 tokens and logits identical in 32/32");
+  `FASTGGUF_HEAD=exact` turns it off. Costs 2 bits per output weight of RAM (41 MB for Gemma 270M).
+
+With the AVX kernels these change results in float rounding only; `FASTGGUF_CPU=generic` keeps
+the scalar formulas.
+
+After this the engine is close to the memory speed of the machine: a token has to read all
+the weights once (minus the output head), so tok/s ≈ memory bandwidth ÷ model size. More cores
+and faster RAM help; a smaller or lower-bit model helps most.
 
 Differences from the C server: requests are parsed with a real JSON parser (`content` may also be
 a list of text parts), and a streamed reply never splits a UTF-8 character across two chunks.
@@ -111,6 +152,7 @@ Build from PowerShell or cmd, not Git Bash: Git Bash's `link` command hides the 
 | `FASTGGUF_CPU=generic` / `avx2` / `avxvnni` / `avx512` | force a CPU kernel set |
 | `FASTGGUF_REPACK=0` | do not re-arrange Q4_K / Q4_0 weights |
 | `FASTGGUF_BATCH=0` | read prompts token by token (same results, slower) |
+| `FASTGGUF_HEAD=exact` | compute the whole output head from the real weights (no 2-bit sketch) |
 | `FASTGGUF_API_KEY=<key>` | the server requires `Authorization: Bearer <key>` |
 | `RAYON_NUM_THREADS=<n>` | number of threads |
 
@@ -122,8 +164,10 @@ src/cli.rs        chat / inspect / dump
 src/gguf.rs       GGUF reader
 src/quant.rs      types, fp16, dequantization, portable dot kernels
 src/simd.rs       AVX2 / AVX-VNNI / AVX-512 kernels (one template, built 3 times) + CPU detection
-src/repack.rs     Q4_K / Q4_0 8-row layout
+src/repack.rs     Q4_K / Q4_0 / Q5_0 8-row layout
+src/pool.rs       thread pool for single-token generation
 src/matvec.rs     multi-threaded matrix × vector
+src/sketch.rs     two-stage output head (2-bit sketch + exact top tokens)
 src/batch.rs      prompt batches: matrix × matrix (GEMM)
 src/gpu.rs        OpenCL: runtime loading, kernels, upload, self-check
 src/server.rs     HTTP server, OpenAI API, web UI

@@ -5,6 +5,7 @@
 //   fastgguf serve    model.gguf [model2.gguf ...] [port 8080] [ctx 4096]
 //   fastgguf inspect  model.gguf
 //   fastgguf dump     model.gguf
+//   fastgguf bench    model.gguf [tokens 128] [ctx 2048]
 //   fastgguf selftest
 //
 //   fastgguf gpu
@@ -19,11 +20,13 @@ mod json;
 mod matvec;
 mod model;
 mod ops;
+mod pool;
 mod quant;
 mod repack;
 mod sampler;
 mod selftest;
 mod server;
+mod sketch;
 mod simd;
 mod tokenizer;
 
@@ -92,13 +95,15 @@ fn parse_chat_args(args: &[String], ctx: &mut usize, max_tokens: &mut i64, smp: 
 
 fn usage() {
     print!(
-        "Usage: fastgguf <chat|serve|inspect|dump|gpu|selftest> <model.gguf> [...]
+        "Usage: fastgguf <chat|serve|bench|inspect|dump|gpu|selftest> <model.gguf> [...]
   chat:  fastgguf chat model.gguf [ctx] [options]
   serve: fastgguf serve model1.gguf [model2.gguf ... up to 4] [port 8080] [ctx 4096]
+  bench: fastgguf bench model.gguf [tokens 128] [ctx 2048]   generation speed, no tokenizer needed
 {CHAT_OPTIONS_HELP}  GPU: FASTGGUF_GPU=on|off|auto  FASTGGUF_GPU_DEVICE=<n>  FASTGGUF_GPU_MEM=<GB>
        FASTGGUF_GPU_LAYERS=<n>
   KV:  FASTGGUF_KV=turbo|turbo8|turbo4|turbo2   TurboQuant KV cache
   CPU: FASTGGUF_CPU=generic|avx2|avxvnni|avx512   FASTGGUF_REPACK=0   FASTGGUF_BATCH=0
+       FASTGGUF_HEAD=exact (no 2-bit sketch of the output head)
        RAYON_NUM_THREADS=<n>
   API: FASTGGUF_API_KEY=<key>   require 'Authorization: Bearer <key>'
 "
@@ -155,6 +160,11 @@ fn run(args: Vec<OsString>) -> Result<i32, String> {
             let mut smp = Sampler::default();
             parse_chat_args(&text[3..], &mut ctx, &mut max_tokens, &mut smp)?;
             cli::cmd_chat(&path, ctx, max_tokens, &mut smp)?;
+        }
+        "bench" => {
+            // fastgguf bench model.gguf [tokens 128] [ctx 2048]
+            let num = |i: usize, def: usize| text.get(i).and_then(|v| v.parse().ok()).unwrap_or(def);
+            cli::cmd_bench(&path, num(4, 2048).max(64), num(3, 128))?;
         }
         "inspect" => cli::cmd_inspect(&path)?,
         "dump" => cli::cmd_dump(&path)?,

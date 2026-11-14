@@ -136,7 +136,7 @@ fn test_kernels(rng: &mut Rng, fails: &mut i32) {
 }
 
 fn test_repack(rng: &mut Rng, fails: &mut i32) {
-    for typ in [T_Q4_K, T_Q4_0] {
+    for typ in [T_Q4_K, T_Q4_0, T_Q5_0] {
         let (cols, rows) = (512, 24);
         let mut data = Vec::new();
         for _ in 0..rows {
@@ -324,6 +324,100 @@ fn test_kvq(rng: &mut Rng, fails: &mut i32) {
     }
 }
 
+/// the vector GELU / SiLU / softmax / soft-cap of every kernel set against the scalar formulas
+fn test_activations(rng: &mut Rng, fails: &mut i32) {
+    let n = 37; // not a multiple of 8: the padded tail runs too
+    let mut g: Vec<f32> = (0..n).map(|_| rng.x() * 4.0).collect();
+    g[..4].copy_from_slice(&[0.0, -40.0, 40.0, 1e-6]);
+    let u: Vec<f32> = (0..n).map(|_| rng.x()).collect();
+    // the scalar gelu and tanh lose digits where 1 + tanh(t) cancels: compare absolutely there
+    let rel = |a: f32, b: f32| (a - b).abs() / (b.abs() + 1.0);
+    let (mut eg, mut es, mut em, mut ec) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    let mut sm_ref = g.clone();
+    let mx = sm_ref.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum: f32 = sm_ref.iter().map(|v| (v - mx).exp()).sum();
+    sm_ref.iter_mut().for_each(|v| *v = (*v - mx).exp() / sum);
+    for l in levels() {
+        simd::set_level(l);
+        let (mut a, mut b, mut c, mut d) = (g.clone(), g.clone(), g.clone(), g.clone());
+        ops::gelu_mul(&mut a, &u);
+        ops::silu_mul(&mut b, &u);
+        ops::softmax(&mut c);
+        ops::softcap(&mut d, 30.0);
+        for i in 0..n {
+            eg = eg.max(rel(a[i], ops::gelu(g[i]) * u[i]));
+            es = es.max(rel(b[i], ops::silu(g[i]) * u[i]));
+            em = em.max(rel(c[i], sm_ref[i]));
+            ec = ec.max(rel(d[i], 30.0 * (g[i] / 30.0).tanh()));
+        }
+    }
+    report(
+        "gelu/silu/softmax/softcap",
+        eg < 1e-5 && es < 1e-5 && em < 1e-5 && ec < 1e-5 && eg + es + em + ec > 0.0,
+        format!("vs scalar err={eg:.1e}/{es:.1e}/{em:.1e}/{ec:.1e}"),
+        fails,
+    );
+}
+
+/// the two-stage output head against the plain one, and the fused matvec against single ones
+fn test_head(rng: &mut Rng, fails: &mut i32) {
+    let (cols, rows) = (64, 16384 + 5); // 5 rows past the last group of 8
+    let mut data = Vec::new();
+    for _ in 0..rows {
+        data.extend(random_row(rng, T_Q8_0, cols));
+    }
+    let data = leak(data);
+    let t = Tensor {
+        name: "selftest".into(),
+        typ: T_Q8_0,
+        n_dims: 2,
+        ne: [cols as u64, rows as u64, 1, 1],
+        data,
+        nbytes: data.len() as u64,
+        rp: None,
+        gpu: None,
+    };
+    let sk = crate::sketch::Sketch::build(&t);
+    let top = |l: &[f32]| {
+        let mut c = Vec::new();
+        top_k_select(l, 64, &mut c);
+        c.sort_unstable_by_key(|e| e.id);
+        c
+    };
+    let (mut same, mut n, mut kern) = (0, 0, true);
+    if let Some(sk) = &sk {
+        for l in levels() {
+            simd::set_level(l);
+            for _ in 0..4 {
+                let x: Vec<f32> = (0..cols).map(|_| rng.x()).collect();
+                let (mut plain, mut fast) = (vec![0.0f32; rows], vec![0.0f32; rows]);
+                matvec(&t, &x, &mut plain).unwrap();
+                sk.matvec(&t, &x, &mut fast).unwrap();
+                let (a, b) = (top(&plain), top(&fast));
+                same += a.iter().zip(&b).all(|(p, q)| p.id == q.id && (p.v - q.v).abs() <= 1e-4 * p.v.abs().max(1.0)) as usize;
+                n += 1;
+            }
+            // the sketch kernel against the portable one: integers, so exactly equal
+            let qs: Vec<u8> = (0..32 * 5).map(|_| rng.byte()).collect();
+            let xq: Vec<i8> = (0..16 * 5).map(|_| rng.byte() as i8).collect();
+            let (mut a, mut b) = ([0i32; 8], [0i32; 8]);
+            crate::sketch::dot_sk2x8(&qs, &xq, &mut a);
+            simd::set_level(Level::Generic);
+            crate::sketch::dot_sk2x8(&qs, &xq, &mut b);
+            kern &= a == b;
+        }
+    }
+    report("two-stage head", sk.is_some() && same == n && kern, format!("top-64 equal to the plain head in {same}/{n}"), fails);
+
+    // Q/K/V in one pass
+    simd::set_level(simd::best());
+    let x: Vec<f32> = (0..cols).map(|_| rng.x()).collect();
+    let (mut a, mut b, mut c) = (vec![0.0f32; rows], vec![0.0f32; rows], vec![0.0f32; rows]);
+    matvec(&t, &x, &mut a).unwrap();
+    crate::matvec::matvec_multi(&x, &mut [(&t, &mut b[..]), (&t, &mut c[..])]).unwrap();
+    report("fused matvec", a == b && a == c, "vs one matrix at a time".into(), fails);
+}
+
 pub fn cmd_selftest() -> i32 {
     let start = simd::level();
     println!("kernels: {} | testing: {}", simd::cpu_name(), levels().iter().map(|l| short(*l)).collect::<Vec<_>>().join(", "));
@@ -343,6 +437,8 @@ pub fn cmd_selftest() -> i32 {
     test_kernels(&mut rng, &mut fails);
     test_repack(&mut rng, &mut fails);
     test_matmul(&mut rng, &mut fails);
+    test_activations(&mut rng, &mut fails);
+    test_head(&mut rng, &mut fails);
     test_sampler(&mut fails);
     test_rope(&mut rng, &mut fails);
     test_kvq(&mut rng, &mut fails);

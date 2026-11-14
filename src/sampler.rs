@@ -41,10 +41,11 @@ pub fn top_k_select(logits: &[f32], k: i32, out: &mut Vec<Cand>) -> usize {
         return n;
     }
     let k = k as usize;
-    // insertion into a small sorted array: most of the vocabulary is rejected with one comparison
-    for (i, &v) in logits.iter().enumerate() {
+    // insertion into a small sorted array; once it is full, 16 values at a time are checked
+    // against the smallest kept value (one vector compare) and almost all of them are skipped
+    let insert = |out: &mut Vec<Cand>, i: usize, v: f32| {
         if out.len() == k && v.partial_cmp(&out[k - 1].v) != Some(std::cmp::Ordering::Greater) {
-            continue;
+            return;
         }
         let mut j = if out.len() < k {
             out.push(Cand { v, id: i as i32 });
@@ -57,6 +58,19 @@ pub fn top_k_select(logits: &[f32], k: i32, out: &mut Vec<Cand>) -> usize {
             j -= 1;
         }
         out[j] = Cand { v, id: i as i32 };
+    };
+    for (i, &v) in logits[..k].iter().enumerate() {
+        insert(out, i, v);
+    }
+    let mut i = k;
+    for c in logits[k..].chunks(16) {
+        let thr = out[k - 1].v;
+        if c.iter().fold(false, |any, &v| any | (v > thr)) {
+            for (j, &v) in c.iter().enumerate() {
+                insert(out, i + j, v);
+            }
+        }
+        i += c.len();
     }
     out.len()
 }

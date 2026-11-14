@@ -163,6 +163,59 @@ pub fn cmd_chat(path: &Path, n_ctx: usize, max_tokens: i64, smp: &mut Sampler) -
     Ok(())
 }
 
+/// generation speed without a tokenizer: a fixed pseudo-random prompt, then n_gen greedy tokens
+pub fn cmd_bench(path: &Path, n_ctx: usize, n_gen: usize) -> Result<(), String> {
+    let g = Gguf::open(path)?;
+    let mut m = Model::load(g, n_ctx)?;
+    println!("=== bench | CPU kernels: {} | {} threads ===", crate::simd::cpu_name(), rayon::current_num_threads());
+    let n_prompt = 32.min(n_ctx / 2);
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let ids: Vec<i32> = (0..n_prompt).map(|_| (crate::ops::rng_next(&mut seed) % m.n_vocab as u64) as i32).collect();
+    let t0 = Instant::now();
+    m.forward_batch(&ids, 0)?;
+    let t_prompt = t0.elapsed().as_secs_f64();
+    let n_gen = n_gen.min(n_ctx - n_prompt);
+    m.prof = [0.0; 4];
+    let t1 = Instant::now();
+    let mut pos = n_prompt;
+    for _ in 0..n_gen {
+        let next = crate::ops::argmax(&m.logits) as i32;
+        m.forward(next, pos)?;
+        pos += 1;
+    }
+    let t_gen = t1.elapsed().as_secs_f64();
+    println!(
+        "prompt: {n_prompt} tok @ {:.1} tok/s | gen: {n_gen} tok @ {:.1} tok/s ({:.2} ms/tok)",
+        n_prompt as f64 / t_prompt.max(1e-9),
+        n_gen as f64 / t_gen.max(1e-9),
+        1e3 * t_gen / n_gen.max(1) as f64
+    );
+    let ms = |v: f64| 1e3 * v / n_gen.max(1) as f64;
+    println!(
+        "per token: projections {:.2} ms | attention {:.2} ms | ffn {:.2} ms | output head {:.2} ms",
+        ms(m.prof[0]),
+        ms(m.prof[1]),
+        ms(m.prof[2]),
+        ms(m.prof[3])
+    );
+    // the two-stage head against the plain one on a few more tokens
+    let (mut same, mut n) = (0, 0);
+    while n < 32 && pos < n_ctx {
+        let next = crate::ops::argmax(&m.logits) as i32;
+        m.forward(next, pos)?;
+        pos += 1;
+        match m.head_check()? {
+            Some(ok) => same += ok as usize,
+            None => break,
+        }
+        n += 1;
+    }
+    if n > 0 {
+        println!("two-stage head: top-64 tokens and logits identical to the plain head in {same}/{n} tokens");
+    }
+    Ok(())
+}
+
 pub fn cmd_inspect(path: &Path) -> Result<(), String> {
     let g = Gguf::open(path)?;
     println!("GGUF v{} | tensors={} | meta={} | align={}", g.version, g.tensors.len(), g.kvs.len(), g.alignment);

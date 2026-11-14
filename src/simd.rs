@@ -741,6 +741,156 @@ macro_rules! x86_kernels {
         }
     }
 
+    // ---- activations ----
+
+    /// e^x for 8 floats (the Cephes expf polynomial, about 1 ulp). x is limited to ±88, so the
+    /// result is always finite; NaN stays NaN
+    #[inline]
+    #[target_feature(enable = $feat)]
+    unsafe fn exp_ps(x: __m256) -> __m256 {
+        let x = _mm256_min_ps(_mm256_set1_ps(88.3), _mm256_max_ps(_mm256_set1_ps(-87.3), x));
+        let n = _mm256_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(_mm256_mul_ps(x, _mm256_set1_ps(1.442_695_f32)));
+        // r = x - n·ln2, ln2 in two parts
+        let r = _mm256_fnmadd_ps(n, _mm256_set1_ps(0.693_359_4_f32), x);
+        let r = _mm256_fnmadd_ps(n, _mm256_set1_ps(-2.121_944_4e-4_f32), r);
+        let mut p = _mm256_set1_ps(1.987_569_1e-4_f32);
+        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.398_2e-3_f32));
+        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(8.333_452e-3_f32));
+        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(4.166_579_6e-2_f32));
+        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.666_666_5e-1_f32));
+        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.5));
+        let y = _mm256_add_ps(_mm256_fmadd_ps(p, _mm256_mul_ps(r, r), r), _mm256_set1_ps(1.0));
+        let pow2 = _mm256_slli_epi32::<23>(_mm256_add_epi32(_mm256_cvtps_epi32(n), _mm256_set1_epi32(127)));
+        _mm256_mul_ps(y, _mm256_castsi256_ps(pow2))
+    }
+
+    /// f over v in vectors of 8; the last partial vector goes through a padded copy
+    #[inline]
+    #[target_feature(enable = $feat)]
+    unsafe fn map2(g: &mut [f32], u: &[f32], f: impl Fn(__m256, __m256) -> __m256) {
+        let n = g.len().min(u.len());
+        let (pg, pu) = (g.as_mut_ptr(), u.as_ptr());
+        let mut i = 0;
+        while i + 8 <= n {
+            _mm256_storeu_ps(pg.add(i), f(_mm256_loadu_ps(pg.add(i)), _mm256_loadu_ps(pu.add(i))));
+            i += 8;
+        }
+        if i < n {
+            let (mut tg, mut tu) = ([0.0f32; 8], [0.0f32; 8]);
+            tg[..n - i].copy_from_slice(&g[i..n]);
+            tu[..n - i].copy_from_slice(&u[i..n]);
+            _mm256_storeu_ps(tg.as_mut_ptr(), f(_mm256_loadu_ps(tg.as_ptr()), _mm256_loadu_ps(tu.as_ptr())));
+            g[i..n].copy_from_slice(&tg[..n - i]);
+        }
+    }
+
+    /// g = gelu(g) · u, with gelu(x) = 0.5x(1 + tanh(t)) written as x / (1 + e^(-2t))
+    #[target_feature(enable = $feat)]
+    pub unsafe fn gelu_mul(g: &mut [f32], u: &[f32]) {
+        map2(g, u, |x, u| {
+            let x3 = _mm256_mul_ps(_mm256_mul_ps(x, x), x);
+            let t = _mm256_mul_ps(_mm256_set1_ps(-2.0 * 0.797_884_6), _mm256_fmadd_ps(_mm256_set1_ps(0.044715), x3, x));
+            let s = _mm256_div_ps(x, _mm256_add_ps(_mm256_set1_ps(1.0), exp_ps(t)));
+            _mm256_mul_ps(s, u)
+        });
+    }
+
+    /// g = silu(g) · u
+    #[target_feature(enable = $feat)]
+    pub unsafe fn silu_mul(g: &mut [f32], u: &[f32]) {
+        map2(g, u, |x, u| {
+            let e = exp_ps(_mm256_sub_ps(_mm256_setzero_ps(), x));
+            _mm256_mul_ps(_mm256_div_ps(x, _mm256_add_ps(_mm256_set1_ps(1.0), e)), u)
+        });
+    }
+
+    /// v = cp · tanh(v / cp)
+    #[target_feature(enable = $feat)]
+    pub unsafe fn softcap(v: &mut [f32], cp: f32) {
+        let n = v.len();
+        let p = v.as_mut_ptr();
+        let f = |x: __m256| {
+            // tanh(z) = 1 - 2 / (e^(2z) + 1)
+            let e = exp_ps(_mm256_mul_ps(x, _mm256_set1_ps(2.0 / cp)));
+            let t = _mm256_sub_ps(_mm256_set1_ps(1.0), _mm256_div_ps(_mm256_set1_ps(2.0), _mm256_add_ps(e, _mm256_set1_ps(1.0))));
+            _mm256_mul_ps(_mm256_set1_ps(cp), t)
+        };
+        let mut i = 0;
+        while i + 8 <= n {
+            _mm256_storeu_ps(p.add(i), f(_mm256_loadu_ps(p.add(i))));
+            i += 8;
+        }
+        if i < n {
+            let mut t = [0.0f32; 8];
+            t[..n - i].copy_from_slice(&v[i..n]);
+            _mm256_storeu_ps(t.as_mut_ptr(), f(_mm256_loadu_ps(t.as_ptr())));
+            v[i..n].copy_from_slice(&t[..n - i]);
+        }
+    }
+
+    /// s = softmax(s)
+    #[target_feature(enable = $feat)]
+    pub unsafe fn softmax(s: &mut [f32]) {
+        let n = s.len();
+        let p = s.as_mut_ptr();
+        let mx = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let vmx = _mm256_set1_ps(mx);
+        let mut acc = _mm256_setzero_ps();
+        let mut i = 0;
+        while i + 8 <= n {
+            let e = exp_ps(_mm256_sub_ps(_mm256_loadu_ps(p.add(i)), vmx));
+            _mm256_storeu_ps(p.add(i), e);
+            acc = _mm256_add_ps(acc, e);
+            i += 8;
+        }
+        let mut sum = hsum_ps(acc);
+        if i < n {
+            let mut t = [0.0f32; 8];
+            t[..n - i].copy_from_slice(&s[i..n]);
+            _mm256_storeu_ps(t.as_mut_ptr(), exp_ps(_mm256_sub_ps(_mm256_loadu_ps(t.as_ptr()), vmx)));
+            for (o, e) in s[i..n].iter_mut().zip(&t) {
+                *o = *e;
+                sum += *e;
+            }
+        }
+        if sum > 0.0 {
+            let inv = _mm256_set1_ps(1.0 / sum);
+            let mut i = 0;
+            while i + 8 <= n {
+                _mm256_storeu_ps(p.add(i), _mm256_mul_ps(_mm256_loadu_ps(p.add(i)), inv));
+                i += 8;
+            }
+            for v in s[i..n].iter_mut() {
+                *v *= 1.0 / sum;
+            }
+        }
+    }
+
+    /// Σ x² in double precision, four sums side by side
+    #[target_feature(enable = $feat)]
+    pub unsafe fn sumsq(x: &[f32]) -> f64 {
+        let n = x.len();
+        let p = x.as_ptr();
+        let mut a0 = _mm256_setzero_pd();
+        let mut a1 = _mm256_setzero_pd();
+        let mut i = 0;
+        while i + 8 <= n {
+            let v0 = _mm256_cvtps_pd(_mm_loadu_ps(p.add(i)));
+            let v1 = _mm256_cvtps_pd(_mm_loadu_ps(p.add(i + 4)));
+            a0 = _mm256_fmadd_pd(v0, v0, a0);
+            a1 = _mm256_fmadd_pd(v1, v1, a1);
+            i += 8;
+        }
+        let a = _mm256_add_pd(a0, a1);
+        let lo = _mm_add_pd(_mm256_castpd256_pd128(a), _mm256_extractf128_pd::<1>(a));
+        let mut s = _mm_cvtsd_f64(_mm_add_sd(lo, _mm_unpackhi_pd(lo, lo)));
+        while i < n {
+            s += x[i] as f64 * x[i] as f64;
+            i += 1;
+        }
+        s
+    }
+
     // ---- prompt batches ----
 
     /// 4 inputs at once for the 32-value types Q8_0 / Q4_0 / Q5_0: each weight block is loaded
@@ -1032,6 +1182,59 @@ macro_rules! x86_kernels {
             acc = _mm256_fmadd_ps(_mm256_mul_ps(d, _mm256_set1_ps(yb.d)), _mm256_cvtepi32_ps(isum), acc);
         }
         _mm256_storeu_ps(out.as_mut_ptr(), acc);
+    }
+
+    #[target_feature(enable = $feat)]
+    pub unsafe fn dot_q50x8(blocks: &[crate::repack::Q50x8], y: &[Q8Blk], out: &mut [f32]) {
+        let m4 = _mm256_set1_epi8(0x0F);
+        let m1 = _mm256_set1_epi8(0x10);
+        let mut acc = _mm256_setzero_ps();
+        for (b, bl) in blocks.iter().enumerate() {
+            let base = bl as *const _ as *const u8;
+            prefetch(base.wrapping_add(2048));
+            prefetch(base.wrapping_add(2048 + 64));
+            prefetch(base.wrapping_add(2048 + 128));
+            let yb = y.get_unchecked(b);
+            // fifth bits: bit s of every byte belongs to step s (low values), bit 4+s to the high ones
+            let hb = ldu(bl.hb.as_ptr() as *const u8);
+            let hbs = [_mm256_slli_epi32::<4>(hb), _mm256_slli_epi32::<3>(hb), _mm256_slli_epi32::<2>(hb), _mm256_slli_epi32::<1>(hb)];
+            let hbh = [hb, _mm256_srli_epi32::<1>(hb), _mm256_srli_epi32::<2>(hb), _mm256_srli_epi32::<3>(hb)];
+            let mut ia = [_mm256_setzero_si256(); 4];
+            for s in 0..4 {
+                let v = ldu(bl.qs[s].as_ptr() as *const u8);
+                let a0 = ld32(yb.qs.as_ptr().add(4 * s) as *const u8);
+                let a1 = ld32(yb.qs.as_ptr().add(16 + 4 * s) as *const u8);
+                let lo = _mm256_or_si256(_mm256_and_si256(v, m4), _mm256_and_si256(hbs[s], m1));
+                let hi = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16::<4>(v), m4), _mm256_and_si256(hbh[s], m1));
+                ia[s] = dp_u8s8_x8(dp_u8s8_x8(_mm256_setzero_si256(), lo, _mm256_set1_epi32(a0)), hi, _mm256_set1_epi32(a1));
+            }
+            let mut isum = _mm256_add_epi32(_mm256_add_epi32(ia[0], ia[1]), _mm256_add_epi32(ia[2], ia[3]));
+            isum = _mm256_sub_epi32(isum, _mm256_set1_epi32(16 * (yb.s16[0] as i32 + yb.s16[1] as i32)));
+            let d = _mm256_cvtph_ps(_mm_loadu_si128(bl.d.as_ptr() as *const __m128i));
+            acc = _mm256_fmadd_ps(_mm256_mul_ps(d, _mm256_set1_ps(yb.d)), _mm256_cvtepi32_ps(isum), acc);
+        }
+        _mm256_storeu_ps(out.as_mut_ptr(), acc);
+    }
+
+    /// the 2-bit sketch of the output head (sketch.rs): si[r] = Σ code·xq for 8 rows.
+    /// One 32-byte load is 16 columns of the 8 rows; four accumulators, one per bit pair
+    #[target_feature(enable = $feat)]
+    pub unsafe fn dot_sk2x8(qs: &[u8], xq: &[i8], si: &mut [i32; 8]) {
+        let m2 = _mm256_set1_epi8(3);
+        let n = (qs.len() / 32).min(xq.len() / 16);
+        let (p, x) = (qs.as_ptr(), xq.as_ptr() as *const u8);
+        let mut acc = [_mm256_setzero_si256(); 4];
+        for q in 0..n {
+            prefetch(p.wrapping_add(q * 32 + 1024));
+            let v = ldu(p.add(q * 32));
+            let xb = x.add(q * 16);
+            acc[0] = dp_u8s8_x8(acc[0], _mm256_and_si256(v, m2), _mm256_set1_epi32(ld32(xb)));
+            acc[1] = dp_u8s8_x8(acc[1], _mm256_and_si256(_mm256_srli_epi16::<2>(v), m2), _mm256_set1_epi32(ld32(xb.add(4))));
+            acc[2] = dp_u8s8_x8(acc[2], _mm256_and_si256(_mm256_srli_epi16::<4>(v), m2), _mm256_set1_epi32(ld32(xb.add(8))));
+            acc[3] = dp_u8s8_x8(acc[3], _mm256_and_si256(_mm256_srli_epi16::<6>(v), m2), _mm256_set1_epi32(ld32(xb.add(12))));
+        }
+        let s = _mm256_add_epi32(_mm256_add_epi32(acc[0], acc[1]), _mm256_add_epi32(acc[2], acc[3]));
+        _mm256_storeu_si256(si.as_mut_ptr() as *mut __m256i, s);
     }
 
     };
