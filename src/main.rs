@@ -101,6 +101,10 @@ fn usage() {
   CPU: FASTGGUF_CPU=generic|avx2|avxvnni|avx512   FASTGGUF_REPACK=0   FASTGGUF_BATCH=0
        RAYON_NUM_THREADS=<n>
   API: FASTGGUF_API_KEY=<key>   require 'Authorization: Bearer <key>'
+  Set variables before the command:
+       bash:       FASTGGUF_GPU=on fastgguf chat model.gguf
+       PowerShell: $env:FASTGGUF_GPU = \"on\"   then   .\\fastgguf.exe chat model.gguf
+       cmd:        set FASTGGUF_GPU=on      then   fastgguf.exe chat model.gguf
 "
     );
 }
