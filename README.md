@@ -74,11 +74,29 @@ A ready-made Windows build is on the [Releases](https://github.com/lawnak/FastGG
 runtime needed). Pushing a `v*` tag builds it with GitHub Actions (`.github/workflows/release.yml`),
 runs `selftest` and attaches the zip to the release.
 
+Unzip it, then run it from PowerShell inside that folder. `.\` is needed: PowerShell does not run
+programs from the current folder without it.
+
+```powershell
+cd $HOME\Downloads\fastgguf-rs-0.2.0-windows-x64   # wherever you unzipped it
+.\fastgguf.exe gpu
+.\fastgguf.exe chat C:\models\gemma-3-1b-it.Q2_K.gguf
+```
+
 ## Build
 
 ```sh
 cargo build --release          # → target/release/fastgguf(.exe)
 ./target/release/fastgguf selftest
+```
+
+Run these inside the project folder: `target\release` is a path relative to where you are. In
+PowerShell the same commands are:
+
+```powershell
+cd C:\path\to\FastGGUF-Rust
+cargo build --release
+.\target\release\fastgguf.exe selftest
 ```
 
 Two crates: `rayon` (thread pool) and `memmap2` (memory-mapped file). The binary itself has no
@@ -88,6 +106,12 @@ For the fastest build on one machine (not portable to older CPUs):
 
 ```sh
 RUSTFLAGS="-C target-cpu=native" cargo build --release
+```
+
+```powershell
+$env:RUSTFLAGS = "-C target-cpu=native"
+cargo build --release
+Remove-Item Env:RUSTFLAGS        # otherwise later builds in this window are native too
 ```
 
 **Windows without Visual Studio C++ tools:** use the GNU toolchain, which brings its own linker:
@@ -100,6 +124,24 @@ rustup override set stable-x86_64-pc-windows-gnu   # run inside this folder
 Build from PowerShell or cmd, not Git Bash: Git Bash's `link` command hides the MSVC linker.
 
 ## Settings
+
+Settings are environment variables, set in the shell before starting `fastgguf`. The
+`NAME=value command` form works only in bash-like shells (Linux, macOS, Git Bash):
+
+```sh
+FASTGGUF_GPU=on ./target/release/fastgguf chat model.gguf
+```
+
+In PowerShell, set the variable first. It stays set until the window is closed or it is removed:
+
+```powershell
+$env:FASTGGUF_GPU = "on"
+$env:FASTGGUF_GPU_LAYERS = "20"
+.\target\release\fastgguf.exe chat C:\models\model.gguf
+Remove-Item Env:FASTGGUF_GPU, Env:FASTGGUF_GPU_LAYERS   # back to the defaults
+```
+
+In cmd: `set FASTGGUF_GPU=on`, then `target\release\fastgguf.exe chat model.gguf`.
 
 | Variable | Effect |
 |---|---|
